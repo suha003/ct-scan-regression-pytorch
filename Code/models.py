@@ -1,0 +1,369 @@
+"""
+MAI/IDL SS26 - Final assignment. 
+
+MG 6/6/2026
+"""
+import torch
+import torch.nn as nn
+
+activation_str = "ReLU"  # Placeholder for activation function, can be replaced with "ReLU" or others as needed.
+
+class VGGBlock(nn.Module):
+    """Modular VGG block with configurable number of conv layers and channels.
+
+    C configuration from Simonyan & Zisserman's VGG paper.
+    """
+    def __init__(self, in_channels, out_channels, num_convs):
+        super().__init__()
+        layers = []
+        current_in_channels = in_channels
+        for i in range(num_convs):
+            is_config_c_tail = (num_convs == 3 and i == 2)
+            kernel_size = 1 if is_config_c_tail else 3
+            # BUG-004 FIX: Use same-padding for both 1x1 and 3x3 convolutions
+            padding = 0 if kernel_size == 1 else 1  # same-padding for both cases
+            layers.append(nn.Conv2d(current_in_channels, out_channels, kernel_size=kernel_size, padding=padding))
+            layers.append(nn.BatchNorm2d(out_channels))
+            layers.append(nn.ReLU(inplace=True))
+            current_in_channels = out_channels # BUG-013 FIX: Update current_in_channels after each convolutional layer
+
+        layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ResBlock(nn.Module):
+    """ResBlock with 3x3 convolutions (He et al., 2016)."""
+    def __init__(self, in_channels, out_channels, activation, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.activation = activation
+        
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # If spatial size shrinks (stride > 1) or channels change, adjust the shortcut
+        self.shortcut = nn.Identity()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.activation(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += identity  
+        out = self.activation(out)
+        return out
+
+
+class AlexNet(nn.Module):
+    """AlexNet (Krizhevsky et al., 2012) adapted for smaller inputs."""
+    def __init__(self, in_channels, drop_rate, num_classes, **kwargs):
+        super().__init__()
+        
+        # BUG-005 FIX: correct the input size for the first convolutional layer to match the input image size
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 48, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(48),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            nn.Conv2d(48, 128, kernel_size=5, padding=2),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 192, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        )
+        
+        # BUG-006 FIX: Adjust the input size for the first linear layer to match the output of the convolutional layers
+        # Input: (batch, 3, 64, 64)
+        # After convs/pools: 64→32→16→8→4, output channels=192
+        # Flattened: 192 * 4 * 4 = 3072 (not 2048)
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=drop_rate),
+            nn.Linear(3072, 1024), #why 3072? Because the output of the last convolutional layer is 192 channels with a spatial size of 4x4, resulting in 192 * 4 * 4 = 3072 features.
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=drop_rate),
+            nn.Linear(1024, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, num_classes), # BUG-007 FIX: Ensure the output layer has the correct number of classes
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+
+class VGG16(nn.Module):
+    """VGG16 in C configuration of Simonyan & Zisserman, (2014) adapted for smaller inputs."""
+    def __init__(self, in_channels, num_classes, drop_rate, **kwargs):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            VGGBlock(in_channels, 64, num_convs=2),
+            VGGBlock(64, 128, num_convs=2),
+            VGGBlock(128, 256, num_convs=3),
+            VGGBlock(256, 512, num_convs=3),
+            VGGBlock(512, 512, num_convs=3)
+        )
+        
+        # BUG-008 FIX: Dynamically calculate the input size for the first linear layer based on the output of the convolutional layers
+        self.classifier = nn.Sequential(
+            nn.Linear(2048, 1024),# why 2048? Because the output of the last VGGBlock is 512 channels with a spatial size of 2x2, resulting in 512 * 2 * 2 = 2048 features.
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=drop_rate),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=drop_rate),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+
+class ResNet18(nn.Module):
+    """ResNet18 (He et al., 2016) adapted for smaller inputs.
+    
+    activation - flexible activation function to allow experimentation (e.g., ReLU, LeakyReLU, etc.)
+    """
+    def __init__(self, in_channels, num_classes, **kwargs):
+        super().__init__()
+
+        activation = getattr(nn, activation_str)
+
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.activation = activation(inplace=True)
+        print("Using activation function:", self.activation)
+        
+        self.stage1 = nn.Sequential(
+            ResBlock(64, 64, activation(inplace=True), stride=1),
+            ResBlock(64, 64, activation(inplace=True), stride=1)
+        )
+        self.stage2 = nn.Sequential(
+            ResBlock(64, 128, activation(inplace=True), stride=2),          
+            ResBlock(128, 128, activation(inplace=True), stride=1)
+        )
+        self.stage3 = nn.Sequential(
+            ResBlock(128, 256, activation(inplace=True), stride=2),
+            ResBlock(256, 256, activation(inplace=True), stride=1)
+        )
+        self.stage4 = nn.Sequential(
+            ResBlock(256, 512, activation(inplace=True), stride=2),
+            ResBlock(512, 512, activation(inplace=True), stride=1)
+        )
+        
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        out = self.activation(self.bn1(self.conv1(x)))
+        out = self.stage1(out)
+        out = self.stage2(out)
+        out = self.stage3(out)
+        out = self.stage4(out)
+        out = self.avgpool(out)
+        out = torch.flatten(out, 1)
+        
+        return self.classifier(out) # BUG-009 FIX: Ensure the output of the forward pass is returned
+
+"""
+DOWNSCALED MODELS for Green Initiative (Task 2)
+"""
+
+# VGG16 - Downscaled
+class DownscaledVGG16(nn.Module):
+    """
+    VGG16 with 50% fewer filters per layer
+    Reduction: 64→32, 128→64, 256→128, 512→256
+    This cuts parameters in HALF while keeping same structure    
+    """
+    
+    def __init__(self, in_channels, num_classes, **kwargs):
+        super().__init__()
+        
+        drop_rate = kwargs.get("drop_rate", 0.5)
+
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),  
+            
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+   
+        self.classifier = nn.Sequential(
+            nn.Linear(1024, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=drop_rate),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=drop_rate),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+# AlexNet - Downscaled
+class DownscaledAlexNet(nn.Module):
+    """
+    AlexNet with 50% fewer filters
+    This cuts parameters in HALF while keeping same structure
+    """
+    
+    def __init__(self, in_channels, num_classes, **kwargs):
+        super().__init__()
+        drop_rate = kwargs.get("drop_rate", 0.5)
+        
+        self.features = nn.Sequential(
+            # Layer 1: Detect edges, simple patterns
+            nn.Conv2d(in_channels, 24, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(24),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            # Layer 2: Combine patterns
+            nn.Conv2d(24, 64, kernel_size=5, padding=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            # Layers 3-5: Recognize objects
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 96, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=drop_rate),
+            nn.Linear(1536, 512),      # HALF of 3072 → HALF of 1024
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=drop_rate),
+            nn.Linear(512, 256),       # HALF (new reduction step)
+            nn.ReLU(inplace=True),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+# ResNet18 - Downscaled
+class DownscaledResNet18(nn.Module):
+    """
+    ResNet18 with 50% fewer channels
+    We keep same depth, just make each stage narrower
+    """
+    
+    def __init__(self, in_channels, num_classes, **kwargs):
+        super().__init__()
+        
+        act_str = kwargs.get("activation_str", "ReLU")
+        if act_str == "Identity":
+            self.activation = nn.Identity()
+        else:
+            self.activation = getattr(nn, act_str)(inplace=True)
+
+        # Initial convolution (before residual blocks)
+        self.conv1 = nn.Conv2d(
+            in_channels, 32, 
+            kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(32)       
+        # Stage 1: 32 channels, same image size
+        self.stage1 = nn.Sequential(
+            ResBlock(32, 32, self.activation, stride=1),
+            ResBlock(32, 32, self.activation, stride=1)
+        )
+        
+        # Stage 2: 64 channels, half image size
+        self.stage2 = nn.Sequential(
+            ResBlock(32, 64, self.activation, stride=2),   # stride=2 shrinks image
+            ResBlock(64, 64, self.activation, stride=1)
+        )
+        
+        # Stage 3: 128 channels, quarter image size
+        self.stage3 = nn.Sequential(
+            ResBlock(64, 128, self.activation, stride=2),
+            ResBlock(128, 128, self.activation, stride=1)
+        )
+        
+        # Stage 4: 256 channels, eighth image size
+        self.stage4 = nn.Sequential(
+            ResBlock(128, 256, self.activation, stride=2),
+            ResBlock(256, 256, self.activation, stride=1)
+        )
+        
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # Average all spatial dimensions
+        self.classifier = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+
+        out = self.activation(self.bn1(self.conv1(x))) 
+        out = self.stage1(out)
+        out = self.stage2(out)
+        out = self.stage3(out)
+        out = self.stage4(out)
+        out = self.avgpool(out)
+        out = torch.flatten(out, 1)
+       
+        return self.classifier(out)
